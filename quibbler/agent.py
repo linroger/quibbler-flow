@@ -6,7 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Union, Optional
 
 # Import existing Claude SDK for fallback/default
 from claude_agent_sdk import (
@@ -43,6 +43,8 @@ class QuibblerConfig:
 
     model: str = DEFAULT_MODEL
     use_iflow: bool = False
+    max_history: int = 20
+    smart_pruning: bool = True
 
 
 def load_config(source_path: str) -> QuibblerConfig:
@@ -61,18 +63,24 @@ def load_config(source_path: str) -> QuibblerConfig:
     Returns:
         QuibblerConfig with the loaded or default model setting
     """
+
+    def _parse_config(data: dict) -> QuibblerConfig:
+        return QuibblerConfig(
+            model=data.get("model", DEFAULT_MODEL),
+            use_iflow=data.get("use_iflow", False),
+            max_history=data.get("max_history", 20),
+            smart_pruning=data.get("smart_pruning", True)
+        )
+
     # Check project-specific config first
     project_config = Path(source_path) / ".quibbler" / "config.json"
     if project_config.exists():
         try:
             with open(project_config) as f:
                 data = json.load(f)
-                model = data.get("model", DEFAULT_MODEL)
-                use_iflow = data.get("use_iflow", False)
-                logger.info(
-                    f"Loaded project config from {project_config}: model={model}, use_iflow={use_iflow}"
-                )
-                return QuibblerConfig(model=model, use_iflow=use_iflow)
+                config = _parse_config(data)
+                logger.info(f"Loaded project config from {project_config}: {config}")
+                return config
         except Exception as e:
             logger.warning(f"Failed to load project config from {project_config}: {e}")
 
@@ -82,21 +90,38 @@ def load_config(source_path: str) -> QuibblerConfig:
         try:
             with open(global_config) as f:
                 data = json.load(f)
-                model = data.get("model", DEFAULT_MODEL)
-                use_iflow = data.get("use_iflow", False)
-                logger.info(f"Loaded global config from {global_config}: model={model}, use_iflow={use_iflow}")
-                return QuibblerConfig(model=model, use_iflow=use_iflow)
+                config = _parse_config(data)
+                logger.info(f"Loaded global config from {global_config}: {config}")
+                return config
         except Exception as e:
             logger.warning(f"Failed to load global config from {global_config}: {e}")
 
     # Check if we are in iFlow environment (if iFlow token is available)
     if get_iflow_auth_token():
         logger.info("iFlow token detected. Using iFlow client by default.")
-        return QuibblerConfig(model="Qwen3-Coder", use_iflow=True)
+        return QuibblerConfig(model="Qwen3-Coder", use_iflow=True, max_history=20, smart_pruning=True)
 
     # Return default
     logger.info(f"No config found, using default model: {DEFAULT_MODEL}")
     return QuibblerConfig(model=DEFAULT_MODEL)
+
+
+def create_client(config: QuibblerConfig, options: Any) -> Union[ClaudeSDKClient, IflowClient]:
+    """Factory to create the appropriate client based on configuration."""
+    if config.use_iflow:
+        logger.info("Creating IflowClient")
+        # We need to pass the history/pruning config to the client options or init
+        # But IflowClient init signature is currently just (options: Any).
+        # We can attach the config to options or modify IflowClient.
+        # Let's attach to options as a hacky way, or better, modify IflowClient __init__.
+        # For now, let's attach to options since ClaudeAgentOptions is flexible or we can subclass/wrap.
+        # Ideally, we update IflowClient to accept specific kwargs, but to keep signature similar:
+        if not hasattr(options, 'quibbler_config'):
+             options.quibbler_config = config
+        return IflowClient(options=options)
+    else:
+        logger.info("Creating ClaudeSDKClient")
+        return ClaudeSDKClient(options=options)
 
 
 @dataclass
@@ -106,10 +131,20 @@ class Quibbler:
     system_prompt: str
     source_path: str
     model: str = DEFAULT_MODEL
-    use_iflow: bool = False
+    # Config object to hold all settings
+    config: QuibblerConfig = field(default_factory=QuibblerConfig)
 
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(), init=False)
     task: asyncio.Task | None = field(default=None, init=False)
+
+    def __post_init__(self):
+        # Ensure config is populated if only model/flags were passed (legacy support if needed)
+        # But mostly we expect the caller to pass 'config' or we load it.
+        # If the caller used the old signature (model=...), we might need to sync it.
+        # But looking at mcp_server.py, we load config first.
+        if self.config.model != self.model:
+             # If model was passed explicitly and differs from default config
+             self.config.model = self.model
 
     async def start(self) -> None:
         """Start the quibbler agent background task"""
@@ -117,7 +152,7 @@ class Quibbler:
             return
         self.task = asyncio.create_task(self._run())
         logger.info(f"Started quibbler with prompt: {self.system_prompt[:100]}...")
-        logger.info(f"Using model: {self.model}, use_iflow: {self.use_iflow}")
+        logger.info(f"Using config: {self.config}")
 
     async def stop(self) -> None:
         """Stop the quibbler agent and wait for task to complete"""
@@ -192,18 +227,19 @@ class Quibbler:
             system_prompt=system_prompt,
             allowed_tools=["Read", "Write"],
             permission_mode="acceptEdits",
-            model=self.model,
+            model=self.config.model,
             hooks={},
             mcp_servers={},
         )
 
-        try:
-            if self.use_iflow:
-                client_cls = IflowClient
-            else:
-                client_cls = ClaudeSDKClient
+        # Attach config to options for the client to use
+        options.quibbler_config = self.config
 
-            async with client_cls(options=options) as client:
+        try:
+            client = create_client(self.config, options)
+            # Use client as context manager manually since create_client returns an instance
+            # handled by 'async with'
+            async with client:
                 # Send startup message
                 await self._send_startup_message(client)
 

@@ -115,6 +115,9 @@ def cmd_hook_add(args):
     if is_iflow:
         print("Detected iFlow configuration. Adding hooks to .iflow/settings.json")
         _add_iflow_hooks()
+        print("\nNote: You can configure Quibbler history behavior in .quibbler/config.json:")
+        print('  "max_history": 20 (default)')
+        print('  "smart_pruning": true (default, keeps first user message)')
     else:
         print("Defaulting to Claude Code configuration. Adding hooks to .claude/settings.json")
         _add_claude_hooks()

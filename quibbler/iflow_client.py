@@ -5,6 +5,7 @@ Mimics portions of ClaudeSDKClient interface but uses iFlow (OpenAI compatible) 
 
 import os
 import json
+import asyncio
 import httpx
 from typing import AsyncGenerator, List, Optional, Any, Dict, Union
 from dataclasses import dataclass, field
@@ -29,7 +30,16 @@ class IflowClient:
         self.model = get_iflow_model()
         self.options = options
         self.history: List[Dict[str, Any]] = []
-        self.max_history_messages = 20 # Token efficiency optimization
+
+        # Configure pruning from options
+        self.max_history_messages = 20
+        self.smart_pruning = True
+
+        if self.options and hasattr(self.options, "quibbler_config"):
+            config = self.options.quibbler_config
+            self.max_history_messages = config.max_history
+            self.smart_pruning = config.smart_pruning
+            logger.info(f"IflowClient configured with max_history={self.max_history_messages}, smart_pruning={self.smart_pruning}")
 
         if self.options and hasattr(self.options, "system_prompt"):
             self.history.append({"role": "system", "content": self.options.system_prompt})
@@ -50,77 +60,125 @@ class IflowClient:
     async def query(self, prompt: str):
         """
         Send a user message to the conversation history.
-        Unlike ClaudeSDKClient which might stream immediately,
-        this prepares the request. The actual call happens in receive_response.
         """
         self.history.append({"role": "user", "content": prompt})
+        self._prune_history()
 
-        # Token efficiency optimization: Prune history
-        # Keep system prompt (index 0) and last N messages
-        if len(self.history) > self.max_history_messages:
-            system_msg = self.history[0] if self.history and self.history[0]["role"] == "system" else None
-            # Keep last N-1 messages (to account for system msg)
-            recent_msgs = self.history[-(self.max_history_messages - 1):]
+    def _prune_history(self):
+        """Prune history for token efficiency."""
+        if len(self.history) <= self.max_history_messages:
+            return
 
-            new_history = []
-            if system_msg:
-                new_history.append(system_msg)
-            new_history.extend(recent_msgs)
+        logger.info(f"Pruning history (current size: {len(self.history)})")
 
-            self.history = new_history
-            logger.info(f"Pruned history to {len(self.history)} messages for token efficiency.")
+        # Identify key messages to preserve
+        system_msg = None
+        first_user_msg = None
+
+        # Find system message (usually first)
+        if self.history and self.history[0]["role"] == "system":
+            system_msg = self.history[0]
+
+        # Find first user message (if smart pruning is enabled)
+        if self.smart_pruning:
+            for msg in self.history:
+                if msg["role"] == "user":
+                    first_user_msg = msg
+                    break
+
+        # Calculate how many recent messages we can keep
+        # Reserved slots: 1 for system (if exists) + 1 for first user (if exists and different)
+        reserved_count = 0
+        if system_msg: reserved_count += 1
+        if first_user_msg and first_user_msg is not system_msg: reserved_count += 1
+
+        keep_count = self.max_history_messages - reserved_count
+        if keep_count < 1: keep_count = 1 # Always keep at least one recent message
+
+        recent_msgs = self.history[-keep_count:]
+
+        # Reconstruct history
+        new_history = []
+        if system_msg:
+            new_history.append(system_msg)
+        if first_user_msg and first_user_msg not in new_history and first_user_msg not in recent_msgs:
+            new_history.append(first_user_msg)
+
+        new_history.extend(recent_msgs)
+
+        self.history = new_history
+        logger.info(f"Pruned history to {len(self.history)} messages.")
 
     async def receive_response(self) -> AsyncGenerator[Union[AssistantMessage, Any], None]:
         """
-        Stream the response from the API.
-        Yields AssistantMessage objects containing TextBlocks.
+        Stream the response from the API with retry logic.
         """
         if not self.api_key:
             logger.error("No iFlow API key found. Please login with iflow-cli.")
             yield AssistantMessage(content=[TextBlock(text="Error: No iFlow API key found. Please login with iflow-cli.")], model=self.model)
             return
 
-        try:
-            async with self.client.stream(
-                "POST",
-                "/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": self.history,
-                    "stream": True,
-                    "temperature": 0.7,
-                },
-            ) as response:
-                if response.status_code != 200:
-                    error_text = await response.read()
-                    logger.error(f"iFlow API Error: {response.status_code} - {error_text}")
-                    yield AssistantMessage(content=[TextBlock(text=f"Error: iFlow API returned {response.status_code}")], model=self.model)
-                    return
+        max_retries = 3
+        retry_delay = 1.0
 
-                full_content = ""
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
+        for attempt in range(max_retries):
+            try:
+                async for chunk in self._stream_response():
+                    yield chunk
+                return # Success
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                logger.warning(f"API attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.error("All API retry attempts failed.")
+                    yield AssistantMessage(content=[TextBlock(text=f"Error: API call failed after {max_retries} attempts: {str(e)}")], model=self.model)
+            except Exception as e:
+                logger.error(f"Unexpected error during API call: {e}")
+                yield AssistantMessage(content=[TextBlock(text=f"Error: {str(e)}")], model=self.model)
+                return
 
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
+    async def _stream_response(self):
+        """Internal helper to handle the actual streaming request."""
+        async with self.client.stream(
+            "POST",
+            "/chat/completions",
+            json={
+                "model": self.model,
+                "messages": self.history,
+                "stream": True,
+                "temperature": 0.7,
+            },
+        ) as response:
+            if response.status_code != 200:
+                error_text = await response.read()
+                raise httpx.HTTPStatusError(
+                    f"Status {response.status_code} - {error_text}",
+                    request=response.request,
+                    response=response
+                )
 
-                    try:
-                        data = json.loads(data_str)
-                        delta = data.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
+            full_content = ""
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
 
-                        if content:
-                            full_content += content
-                            yield AssistantMessage(content=[TextBlock(text=content)], model=self.model)
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
 
-                    except json.JSONDecodeError:
-                        pass
+                try:
+                    data = json.loads(data_str)
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
 
-                # Update history with the full response
-                self.history.append({"role": "assistant", "content": full_content})
+                    if content:
+                        full_content += content
+                        yield AssistantMessage(content=[TextBlock(text=content)], model=self.model)
 
-        except Exception as e:
-            logger.error(f"Exception during iFlow API call: {e}")
-            yield AssistantMessage(content=[TextBlock(text=f"Error: {str(e)}")], model=self.model)
+                except json.JSONDecodeError:
+                    pass
+
+            # Update history with the full response
+            self.history.append({"role": "assistant", "content": full_content})
