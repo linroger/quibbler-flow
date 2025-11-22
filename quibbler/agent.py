@@ -6,8 +6,9 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
+# Import existing Claude SDK for fallback/default
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -16,6 +17,9 @@ from claude_agent_sdk import (
 )
 
 from quibbler.logger import get_logger
+# Import new iFlow integration
+from quibbler.iflow_client import IflowClient
+from quibbler.iflow_config import get_iflow_auth_token
 
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -38,6 +42,7 @@ class QuibblerConfig:
     """Configuration for Quibbler agent"""
 
     model: str = DEFAULT_MODEL
+    use_iflow: bool = False
 
 
 def load_config(source_path: str) -> QuibblerConfig:
@@ -47,7 +52,8 @@ def load_config(source_path: str) -> QuibblerConfig:
     Checks for config in this order:
     1. Project-specific: {source_path}/.quibbler/config.json
     2. Global: ~/.quibbler/config.json
-    3. Default: DEFAULT_MODEL
+    3. iFlow Environment check
+    4. Default: DEFAULT_MODEL
 
     Args:
         source_path: Project directory to check for project-specific config
@@ -62,10 +68,11 @@ def load_config(source_path: str) -> QuibblerConfig:
             with open(project_config) as f:
                 data = json.load(f)
                 model = data.get("model", DEFAULT_MODEL)
+                use_iflow = data.get("use_iflow", False)
                 logger.info(
-                    f"Loaded project config from {project_config}: model={model}"
+                    f"Loaded project config from {project_config}: model={model}, use_iflow={use_iflow}"
                 )
-                return QuibblerConfig(model=model)
+                return QuibblerConfig(model=model, use_iflow=use_iflow)
         except Exception as e:
             logger.warning(f"Failed to load project config from {project_config}: {e}")
 
@@ -76,10 +83,16 @@ def load_config(source_path: str) -> QuibblerConfig:
             with open(global_config) as f:
                 data = json.load(f)
                 model = data.get("model", DEFAULT_MODEL)
-                logger.info(f"Loaded global config from {global_config}: model={model}")
-                return QuibblerConfig(model=model)
+                use_iflow = data.get("use_iflow", False)
+                logger.info(f"Loaded global config from {global_config}: model={model}, use_iflow={use_iflow}")
+                return QuibblerConfig(model=model, use_iflow=use_iflow)
         except Exception as e:
             logger.warning(f"Failed to load global config from {global_config}: {e}")
+
+    # Check if we are in iFlow environment (if iFlow token is available)
+    if get_iflow_auth_token():
+        logger.info("iFlow token detected. Using iFlow client by default.")
+        return QuibblerConfig(model="Qwen3-Coder", use_iflow=True)
 
     # Return default
     logger.info(f"No config found, using default model: {DEFAULT_MODEL}")
@@ -93,6 +106,7 @@ class Quibbler:
     system_prompt: str
     source_path: str
     model: str = DEFAULT_MODEL
+    use_iflow: bool = False
 
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(), init=False)
     task: asyncio.Task | None = field(default=None, init=False)
@@ -103,7 +117,7 @@ class Quibbler:
             return
         self.task = asyncio.create_task(self._run())
         logger.info(f"Started quibbler with prompt: {self.system_prompt[:100]}...")
-        logger.info(f"Using model: {self.model}")
+        logger.info(f"Using model: {self.model}, use_iflow: {self.use_iflow}")
 
     async def stop(self) -> None:
         """Stop the quibbler agent and wait for task to complete"""
@@ -119,9 +133,9 @@ class Quibbler:
         return self.system_prompt
 
     async def _query_and_collect_text(
-        self, client: ClaudeSDKClient, prompt: str
+        self, client: Union[ClaudeSDKClient, IflowClient], prompt: str
     ) -> str:
-        """Send query to Claude and collect text response"""
+        """Send query to Client and collect text response"""
         await client.query(prompt)
 
         feedback_parts = []
@@ -137,8 +151,8 @@ class Quibbler:
 
         return "".join(feedback_parts)
 
-    async def _query_and_consume(self, client: ClaudeSDKClient, prompt: str) -> None:
-        """Send query to Claude and consume response (don't collect)"""
+    async def _query_and_consume(self, client: Union[ClaudeSDKClient, IflowClient], prompt: str) -> None:
+        """Send query to Client and consume response (don't collect)"""
         await client.query(prompt)
         async for message in client.receive_response():
             msg_type = type(message).__name__
@@ -155,11 +169,11 @@ class Quibbler:
             # Log full message to see tool use
             logger.info("event> FULL MESSAGE: %s", str(message)[:1000])
 
-    async def _send_startup_message(self, client: ClaudeSDKClient) -> None:
+    async def _send_startup_message(self, client: Union[ClaudeSDKClient, IflowClient]) -> None:
         """Send startup message - subclasses must override"""
         raise NotImplementedError("Subclasses must implement _send_startup_message")
 
-    async def _run_loop(self, client: ClaudeSDKClient) -> None:
+    async def _run_loop(self, client: Union[ClaudeSDKClient, IflowClient]) -> None:
         """Run the main processing loop - subclasses must override"""
         raise NotImplementedError("Subclasses must implement _run_loop")
 
@@ -184,7 +198,12 @@ class Quibbler:
         )
 
         try:
-            async with ClaudeSDKClient(options=options) as client:
+            if self.use_iflow:
+                client_cls = IflowClient
+            else:
+                client_cls = ClaudeSDKClient
+
+            async with client_cls(options=options) as client:
                 # Send startup message
                 await self._send_startup_message(client)
 
@@ -223,7 +242,7 @@ class QuibblerMCP(Quibbler):
 
         return feedback
 
-    async def _send_startup_message(self, client: ClaudeSDKClient) -> None:
+    async def _send_startup_message(self, client: Union[ClaudeSDKClient, IflowClient]) -> None:
         """Send MCP-specific startup message"""
         startup_msg = (
             "Quibbler session started. You will receive code review requests AFTER changes have been made. "
@@ -235,7 +254,7 @@ class QuibblerMCP(Quibbler):
         async for message in client.receive_response():
             logger.info("startup> type=%s", type(message).__name__)
 
-    async def _run_loop(self, client: ClaudeSDKClient) -> None:
+    async def _run_loop(self, client: Union[ClaudeSDKClient, IflowClient]) -> None:
         """Process MCP review requests (synchronous responses)"""
         while True:
             review_request, response_future = await self.queue.get()
@@ -271,7 +290,7 @@ class QuibblerHook(Quibbler):
         logger.info(f"Hook mode: feedback file = {message_file}")
         return self.system_prompt.format(message_file=message_file)
 
-    async def _send_startup_message(self, client: ClaudeSDKClient) -> None:
+    async def _send_startup_message(self, client: Union[ClaudeSDKClient, IflowClient]) -> None:
         """Send hook-specific startup message"""
         startup_msg = (
             "Quibbler session started. Watch the events and intervene when necessary. "
@@ -282,7 +301,7 @@ class QuibblerHook(Quibbler):
         async for message in client.receive_response():
             logger.info("startup> type=%s", type(message).__name__)
 
-    async def _run_loop(self, client: ClaudeSDKClient) -> None:
+    async def _run_loop(self, client: Union[ClaudeSDKClient, IflowClient]) -> None:
         """Process hook events (fire-and-forget)"""
         while True:
             evt = await self.queue.get()
