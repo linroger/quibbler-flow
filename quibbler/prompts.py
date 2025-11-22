@@ -25,6 +25,7 @@ QUIBBLER_BASE_INSTRUCTIONS = dedent(
     - Created new patterns instead of following existing ones
     - Made assumptions instead of checking the actual codebase
     - Misunderstood what the user actually asked for
+    - Forgotten previous context or instructions
 
     Your job is to CATCH these issues in the completed code.
 

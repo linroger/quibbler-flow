@@ -10,6 +10,7 @@ from quibbler.mcp_server import run_server as run_mcp_server
 from quibbler.hook_server import run_server as run_hook_server
 from quibbler.hook_forward import forward_hook
 from quibbler.hook_display import display_feedback
+from quibbler.iflow_config import get_iflow_auth_token
 
 
 def cmd_mcp(args):
@@ -23,9 +24,8 @@ def cmd_hook_server(args):
     run_hook_server(port=port)
 
 
-def cmd_hook_add(args):
+def _add_claude_hooks():
     """Add quibbler hooks to .claude/settings.json"""
-    # Find .claude/settings.json
     claude_dir = Path.cwd() / ".claude"
     settings_file = claude_dir / "settings.json"
 
@@ -33,14 +33,34 @@ def cmd_hook_add(args):
         claude_dir.mkdir(parents=True, exist_ok=True)
         print(f"Created {claude_dir}")
 
-    # Load existing settings or create new
+    _update_hooks_in_settings(settings_file)
+    print(f"✓ Added quibbler hooks to {settings_file}")
+
+
+def _add_iflow_hooks():
+    """Add quibbler hooks to .iflow/settings.json"""
+    iflow_dir = Path.cwd() / ".iflow"
+    settings_file = iflow_dir / "settings.json"
+
+    if not iflow_dir.exists():
+        iflow_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Created {iflow_dir}")
+
+    _update_hooks_in_settings(settings_file)
+    print(f"✓ Added quibbler hooks to {settings_file}")
+
+
+def _update_hooks_in_settings(settings_file: Path):
+    """Helper to update hooks configuration in a settings file"""
     if settings_file.exists():
         with open(settings_file) as f:
-            settings = json.load(f)
+            try:
+                settings = json.load(f)
+            except json.JSONDecodeError:
+                settings = {}
     else:
         settings = {}
 
-    # Ensure hooks section exists
     if "hooks" not in settings:
         settings["hooks"] = {}
 
@@ -75,11 +95,29 @@ def cmd_hook_add(args):
         {"hooks": [{"type": "command", "command": "quibbler hook notify"}]}
     ]
 
-    # Write back to file
     with open(settings_file, "w") as f:
         json.dump(settings, f, indent=2)
 
-    print(f"✓ Added quibbler hooks to {settings_file}")
+
+def cmd_hook_add(args):
+    """Add quibbler hooks to configuration settings"""
+    # Check if we should default to iflow or claude
+    # If explicitly requested or iflow detected, try iflow.
+    # For now, we'll try to detect or just do both if unsure, or check args.
+
+    is_iflow = False
+    if get_iflow_auth_token():
+        is_iflow = True
+
+    # We could add an argument to force one or the other
+    # But typically iflow users will have iflow installed/configured.
+
+    if is_iflow:
+        print("Detected iFlow configuration. Adding hooks to .iflow/settings.json")
+        _add_iflow_hooks()
+    else:
+        print("Defaulting to Claude Code configuration. Adding hooks to .claude/settings.json")
+        _add_claude_hooks()
 
 
 def cmd_hook_forward(args):
@@ -109,12 +147,12 @@ def main():
 
     # MCP command - runs MCP server via stdio
     parser_mcp = subparsers.add_parser(
-        "mcp", help="Run MCP server (for Cursor, Claude Desktop, etc.)"
+        "mcp", help="Run MCP server (for Cursor, Claude Desktop, iFlow CLI, etc.)"
     )
     parser_mcp.set_defaults(func=cmd_mcp)
 
     # Hook command - has subcommands for server, add, forward, notify
-    parser_hook = subparsers.add_parser("hook", help="Hook mode for Claude Code")
+    parser_hook = subparsers.add_parser("hook", help="Hook mode for Claude Code / iFlow CLI")
     # Default to 'server' if no subcommand given
     parser_hook.set_defaults(func=cmd_hook_server, port=None)
 
@@ -136,7 +174,7 @@ def main():
 
     # Hook add subcommand
     parser_hook_add = hook_subparsers.add_parser(
-        "add", help="Add hooks to .claude/settings.json"
+        "add", help="Add hooks to settings.json (detects iFlow/Claude)"
     )
     parser_hook_add.set_defaults(func=cmd_hook_add)
 
