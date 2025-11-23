@@ -6,6 +6,7 @@ Mimics portions of ClaudeSDKClient interface but uses iFlow (OpenAI compatible) 
 import os
 import json
 import httpx
+import asyncio
 from typing import AsyncGenerator, List, Optional, Any, Dict, Union
 from dataclasses import dataclass, field
 
@@ -29,7 +30,10 @@ class IflowClient:
         self.model = get_iflow_model()
         self.options = options
         self.history: List[Dict[str, Any]] = []
-        self.max_history_messages = 20 # Token efficiency optimization
+
+        # Token efficiency settings
+        self.max_history_messages = 20
+        self.max_message_length = 20000  # Truncate extremely long messages (chars)
 
         if self.options and hasattr(self.options, "system_prompt"):
             self.history.append({"role": "system", "content": self.options.system_prompt})
@@ -37,7 +41,7 @@ class IflowClient:
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=60.0
+            timeout=120.0  # Increased timeout
         )
         self._response_generator: Optional[AsyncGenerator] = None
 
@@ -47,13 +51,20 @@ class IflowClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.client.aclose()
 
+    def _truncate_content(self, content: str) -> str:
+        """Truncate content if it exceeds max length."""
+        if len(content) > self.max_message_length:
+            return content[:self.max_message_length] + f"\n... [Truncated {len(content) - self.max_message_length} chars] ..."
+        return content
+
     async def query(self, prompt: str):
         """
         Send a user message to the conversation history.
         Unlike ClaudeSDKClient which might stream immediately,
         this prepares the request. The actual call happens in receive_response.
         """
-        self.history.append({"role": "user", "content": prompt})
+        truncated_prompt = self._truncate_content(prompt)
+        self.history.append({"role": "user", "content": truncated_prompt})
 
         # Token efficiency optimization: Prune history
         # Keep system prompt (index 0) and last N messages
@@ -80,47 +91,65 @@ class IflowClient:
             yield AssistantMessage(content=[TextBlock(text="Error: No iFlow API key found. Please login with iflow-cli.")], model=self.model)
             return
 
-        try:
-            async with self.client.stream(
-                "POST",
-                "/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": self.history,
-                    "stream": True,
-                    "temperature": 0.7,
-                },
-            ) as response:
-                if response.status_code != 200:
-                    error_text = await response.read()
-                    logger.error(f"iFlow API Error: {response.status_code} - {error_text}")
-                    yield AssistantMessage(content=[TextBlock(text=f"Error: iFlow API returned {response.status_code}")], model=self.model)
-                    return
+        retries = 3
+        backoff = 1.0
 
-                full_content = ""
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
+        for attempt in range(retries):
+            try:
+                async with self.client.stream(
+                    "POST",
+                    "/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": self.history,
+                        "stream": True,
+                        "temperature": 0.0, # Lower temperature for more deterministic code review
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        error_text = await response.read()
+                        logger.error(f"iFlow API Error (Attempt {attempt+1}): {response.status_code} - {error_text}")
+                        if attempt < retries - 1 and response.status_code in [429, 500, 502, 503, 504]:
+                            await asyncio.sleep(backoff)
+                            backoff *= 2
+                            continue
 
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
+                        yield AssistantMessage(content=[TextBlock(text=f"Error: iFlow API returned {response.status_code}")], model=self.model)
+                        return
 
-                    try:
-                        data = json.loads(data_str)
-                        delta = data.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
+                    full_content = ""
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
 
-                        if content:
-                            full_content += content
-                            yield AssistantMessage(content=[TextBlock(text=content)], model=self.model)
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
 
-                    except json.JSONDecodeError:
-                        pass
+                        try:
+                            data = json.loads(data_str)
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
 
-                # Update history with the full response
-                self.history.append({"role": "assistant", "content": full_content})
+                            if content:
+                                full_content += content
+                                yield AssistantMessage(content=[TextBlock(text=content)], model=self.model)
 
-        except Exception as e:
-            logger.error(f"Exception during iFlow API call: {e}")
-            yield AssistantMessage(content=[TextBlock(text=f"Error: {str(e)}")], model=self.model)
+                        except json.JSONDecodeError:
+                            pass
+
+                    # Update history with the full response
+                    self.history.append({"role": "assistant", "content": full_content})
+                    return # Success
+
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                 logger.error(f"Connection error (Attempt {attempt+1}): {e}")
+                 if attempt < retries - 1:
+                     await asyncio.sleep(backoff)
+                     backoff *= 2
+                     continue
+                 yield AssistantMessage(content=[TextBlock(text=f"Error: Connection failed - {str(e)}")], model=self.model)
+            except Exception as e:
+                logger.error(f"Exception during iFlow API call: {e}")
+                yield AssistantMessage(content=[TextBlock(text=f"Error: {str(e)}")], model=self.model)
+                return
