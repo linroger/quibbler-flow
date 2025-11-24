@@ -23,16 +23,52 @@ from quibbler.iflow_config import get_iflow_auth_token
 
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+MAX_EVENT_CONTENT_LENGTH = 10000  # Max chars for hook event content to prevent token explosion
 
 
 logger = get_logger(__name__)
 
 
 def format_event_for_agent(evt: dict[str, Any]) -> str:
-    """Format hook event for the quibbler agent"""
-    event_type = evt.get("event", "UnknownEvent")
-    ts = evt.get("received_at", datetime.now(timezone.utc).isoformat())
-    pretty_json = json.dumps(evt, indent=2, ensure_ascii=False)
+    """Format hook event for the quibbler agent with truncation for large content"""
+    # Create a copy to avoid modifying the original event
+    evt_copy = evt.copy()
+
+    # Truncate large fields if they exist
+    if "result" in evt_copy and isinstance(evt_copy["result"], dict):
+        result = evt_copy["result"]
+        if "content" in result and isinstance(result["content"], str):
+            if len(result["content"]) > MAX_EVENT_CONTENT_LENGTH:
+                result["content"] = (
+                    result["content"][:MAX_EVENT_CONTENT_LENGTH]
+                    + f"\n... [Truncated {len(result['content']) - MAX_EVENT_CONTENT_LENGTH} chars] ..."
+                )
+
+    # Handle tool use input/output
+    if "tool_use" in evt_copy:
+        # Truncate large input arguments
+        tool_use = evt_copy["tool_use"]
+        if isinstance(tool_use, dict) and "input" in tool_use:
+            # Input can be dict or other json serializable
+            input_str = str(tool_use["input"])
+            if len(input_str) > MAX_EVENT_CONTENT_LENGTH:
+                 # We can't easily modify the dict in place if it's structured data we want to preserve structure of
+                 # But for the prompt string, we can just note it's truncated in the json representation later?
+                 # Or we can try to truncate specific string values.
+                 # For simplicity, we'll just truncate the string representation if it's too huge in the final json dump.
+                 pass
+
+    event_type = evt_copy.get("event", "UnknownEvent")
+    ts = evt_copy.get("received_at", datetime.now(timezone.utc).isoformat())
+
+    try:
+        pretty_json = json.dumps(evt_copy, indent=2, ensure_ascii=False)
+        if len(pretty_json) > MAX_EVENT_CONTENT_LENGTH * 2: # extra buffer for other fields
+             pretty_json = pretty_json[:MAX_EVENT_CONTENT_LENGTH * 2] + "\n... [Truncated Event JSON] ..."
+    except TypeError:
+        pretty_json = str(evt_copy)
+        if len(pretty_json) > MAX_EVENT_CONTENT_LENGTH * 2:
+             pretty_json = pretty_json[:MAX_EVENT_CONTENT_LENGTH * 2] + "\n... [Truncated Event String] ..."
 
     return f"HOOK EVENT: {event_type}\ntime: {ts}\n\n```json\n{pretty_json}\n```"
 
